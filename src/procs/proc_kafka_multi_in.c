@@ -27,7 +27,7 @@
  */
 
 /**
- * Apache Kafka consumer & producer performance tester
+ * based on librdkafka Apache Kafka consumer example
  * using the Kafka driver from librdkafka
  * (https://github.com/edenhill/librdkafka)
  */
@@ -60,6 +60,12 @@ char *proc_alias[]     = { NULL };
 char proc_name[]       = PROC_NAME;
 char proc_purpose[]    = "multi topic kafka subscriber";
 char proc_nonswitch_opts[] = "kafka topic:partition to subscribe";
+proc_port_t proc_input_ports[] =  {
+     {"STAT","append running stats to tuple"},
+     {"STATS","append running stats to tuple"},
+     {"TRIGGER","append running stats to tuple"},
+     {NULL, NULL}
+};
 proc_option_t proc_opts[] = {
      /*  'option character', "long option string", "option argument",
 	 "option description", <allow multiple>, <required>*/
@@ -71,6 +77,8 @@ proc_option_t proc_opts[] = {
      "consumer group",0,0},
      {'S',"","",
      "detect if buffer is ascii strings",0,0},
+     {'X',"","key=value",
+     "set kafka config option",0,0},
      //the following must be left as-is to signify the end of the array
      {' ',"","",
      "",0,0}
@@ -78,11 +86,13 @@ proc_option_t proc_opts[] = {
 
 //function prototypes for local functions
 static int data_source(void *, wsdata_t*, ws_doutput_t*, int);
+static int proc_stats(void *, wsdata_t*, ws_doutput_t*, int);
 
 #define GRP_MAX 64
 typedef struct _proc_instance_t {
      uint64_t meta_process_cnt;
      uint64_t outcnt;
+     uint64_t outlen;
 
      ws_outtype_t * outtype_tuple;
      char * tasks;
@@ -94,7 +104,10 @@ typedef struct _proc_instance_t {
      wslabel_t * label_buf;
      wslabel_t * label_tuple;
      wslabel_t * label_topic;
+     wslabel_t * label_partition;
      wslabel_t * label_datetime;
+     wslabel_t * label_outcnt;
+     wslabel_t * label_outlen;
 
      rd_kafka_t *rk;
 	rd_kafka_conf_t *conf;
@@ -106,12 +119,42 @@ typedef struct _proc_instance_t {
      int stringdetect;
 } proc_instance_t;
 
+
+static int handle_kafka_config_option(proc_instance_t * proc, char * kv) {
+     char * key = kv;
+     char * value = strchr(kv,'=');
+     if (!value || (key == value)) {
+          tool_print("invalid key=value combination");
+          return 0; //invalid key=value combination
+     }
+
+     //split into two strings: key and value
+     value[0] = 0;   //convert = to null
+     value++;
+
+     rd_kafka_conf_res_t res;
+
+     res = rd_kafka_topic_conf_set(proc->topic_conf, key, value, NULL, 0);
+
+     //if not topic config -- try general config
+     if (res == RD_KAFKA_CONF_UNKNOWN) {
+          res = rd_kafka_conf_set(proc->conf, key, value, NULL, 0);
+     }
+     if (res != RD_KAFKA_CONF_OK) {
+          tool_print("INVALID kafka config option %s=%s", key, value);
+          return 0;
+     }
+     tool_print("setting kafka config option %s=%s", key, value);
+     return 1;
+}
+
+
 static int proc_cmd_options(int argc, char ** argv, 
                              proc_instance_t * proc, void * type_table) {
 
      int op;
 
-     while ((op = getopt(argc, argv, "g:Sb:p:L:")) != EOF) {
+     while ((op = getopt(argc, argv, "X:g:Sb:p:L:")) != EOF) {
           switch (op) {
           case 'g':
                proc->group = optarg;
@@ -130,10 +173,17 @@ static int proc_cmd_options(int argc, char ** argv,
           case 'S':
                proc->stringdetect = 1;
                break;
+          case 'X':
+               if (!handle_kafka_config_option(proc, optarg)) {
+                    error_print("invalid kafka option");
+                    return 0;
+               }
+               break; 
           default:
                return 0;
           }
      }
+     rd_kafka_conf_set_default_topic_conf(proc->conf, proc->topic_conf);
      if (optind < argc) {
           proc->topics = rd_kafka_topic_partition_list_new(argc - optind);
      }
@@ -160,7 +210,7 @@ static int proc_cmd_options(int argc, char ** argv,
 
      return 1;
 }
-/*
+
 static void print_partition_list (FILE *fp,
                                   const rd_kafka_topic_partition_list_t
                                   *partitions) {
@@ -172,9 +222,10 @@ static void print_partition_list (FILE *fp,
                   partitions->elems[i].partition,
                   partitions->elems[i].offset);
      }
-     fprintf(stderr, "\n");
-
-}*/
+     if (i) {
+          fprintf(stderr, "\n");
+     }
+}
 
 static void rebalance_cb (rd_kafka_t *rk,
                           rd_kafka_resp_err_t err,
@@ -186,13 +237,13 @@ static void rebalance_cb (rd_kafka_t *rk,
      switch (err) {
      case RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS:
           tool_print("      assigned");
-          //print_partition_list(stderr, partitions);
+          print_partition_list(stderr, partitions);
           rd_kafka_assign(proc->rk, partitions);
           break;
 
      case RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS:
           tool_print("      revoked");
-          //print_partition_list(stderr, partitions);
+          print_partition_list(stderr, partitions);
           rd_kafka_assign(proc->rk, NULL);
           break;
 
@@ -204,14 +255,14 @@ static void rebalance_cb (rd_kafka_t *rk,
 }
 
 static void err_cb (rd_kafka_t *rk, int err, const char *reason, void *opaque) {
-	printf("%% ERROR CALLBACK: %s: %s: %s\n",
+	fprintf(stderr, "%% ERROR CALLBACK: %s: %s: %s\n",
 	       rd_kafka_name(rk), rd_kafka_err2str(err), reason);
 }
 
 static void throttle_cb (rd_kafka_t *rk, const char *broker_name,
 			 int32_t broker_id, int throttle_time_ms,
 			 void *opaque) {
-	printf("%% THROTTLED %dms by %s (%"PRId32")\n", throttle_time_ms,
+	fprintf(stderr, "%% THROTTLED %dms by %s (%"PRId32")\n", throttle_time_ms,
 	       broker_name, broker_id);
 }
                                         
@@ -231,7 +282,10 @@ int proc_init(wskid_t * kid, int argc, char ** argv, void ** vinstance, ws_sourc
      proc->label_buf = wsregister_label(type_table, "BUF");
      proc->label_tuple = wsregister_label(type_table, "KAFKA");
      proc->label_topic = wsregister_label(type_table, "TOPIC");
+     proc->label_partition = wsregister_label(type_table, "PARTITION");
      proc->label_datetime = wsregister_label(type_table, "DATETIME");
+     proc->label_outcnt = wsregister_label(type_table, "KAFKA_IN_COUNT");
+     proc->label_outlen = wsregister_label(type_table, "KAFKA_IN_OUTBYTES");
 
      snprintf(proc->group_default,GRP_MAX,"%s:%d", PROC_NAME, rand());
      proc->group = proc->group_default;
@@ -246,7 +300,6 @@ int proc_init(wskid_t * kid, int argc, char ** argv, void ** vinstance, ws_sourc
                              NULL, 0);
      rd_kafka_topic_conf_set(proc->topic_conf, "offset.store.method",
                              "broker", NULL, 0);
-     rd_kafka_conf_set_default_topic_conf(proc->conf, proc->topic_conf);
 
      proc->brokers = "localhost:9092";
 
@@ -316,6 +369,17 @@ proc_process_t proc_input_set(void * vinstance, wsdatatype_t * input_type,
                               wslabel_t * port,
                               ws_outlist_t* olist, int type_index,
                               void * type_table) {
+     proc_instance_t * proc = (proc_instance_t*)vinstance;
+     if ((input_type == dtype_tuple) && 
+         (wslabel_match(type_table, port, "STAT") ||
+          wslabel_match(type_table, port, "TRIGGER") ||
+          wslabel_match(type_table, port, "STATS"))) {
+          if (!proc->outtype_tuple) {
+               proc->outtype_tuple = ws_add_outtype(olist, dtype_tuple, NULL);
+          }
+          return proc_stats;
+     }
+
      return NULL;
 }
 
@@ -332,7 +396,7 @@ static void msg_consume (rd_kafka_message_t *rkmessage, void *vproc) {
                return;
           }
 
-		printf("%% Consume error for topic \"%s\" [%"PRId32"] "
+		fprintf(stderr,"%% Consume error for topic \"%s\" [%"PRId32"] "
 		       "offset %"PRId64": %s\n",
 		       rkmessage->rkt ? rd_kafka_topic_name(rkmessage->rkt):"",
 		       rkmessage->partition,
@@ -383,9 +447,12 @@ static void msg_consume (rd_kafka_message_t *rkmessage, void *vproc) {
                tuple_dupe_binary(tuple, proc->label_buf, (char *)rkmessage->payload,
                                  (int)rkmessage->len);
           }
+          tuple_member_create_int(tuple, rkmessage->partition,
+                                  proc->label_partition);
 
           ws_set_outdata(tuple, proc->outtype_tuple, proc->dout);
           proc->outcnt++;
+          proc->outlen += rkmessage->len;
 
      }
      dprint("payload> %.*s\n",
@@ -416,11 +483,24 @@ static int data_source(void * vinstance, wsdata_t* source_data,
      return 1;
 }
 
+//append current stats when a stats tuple is sent on the STAT port 
+static int proc_stats(void * vinstance, wsdata_t* input_data,
+                      ws_doutput_t * dout, int type_index) {
+     proc_instance_t * proc = (proc_instance_t*)vinstance;
+
+     tuple_member_create_uint64(input_data, proc->outcnt,
+                                proc->label_outcnt);
+     tuple_member_create_uint64(input_data, proc->outlen,
+                                proc->label_outlen);
+     ws_set_outdata(input_data, proc->outtype_tuple, dout);
+     return 1;
+}
+
 //return 1 if successful
 //return 0 if no..
 int proc_destroy(void * vinstance) {
      proc_instance_t * proc = (proc_instance_t*)vinstance;
-     tool_print("meta_proc cnt %" PRIu64, proc->meta_process_cnt);
+     tool_print("polling loop cnt %" PRIu64, proc->meta_process_cnt);
      tool_print("output cnt %" PRIu64, proc->outcnt);
 
      if (proc->rk) {
