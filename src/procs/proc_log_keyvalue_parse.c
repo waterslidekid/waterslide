@@ -46,7 +46,7 @@ char *proc_menus[]     = { "Filters", NULL };
 char *proc_alias[]     = { "kvparse", "kvlog", "kvp", "syslog", NULL };
 char proc_name[]       = PROC_NAME;
 char proc_purpose[]    = "decode logs that have key=value substrings";
-char *proc_synopsis[] = { "substring LABEL_TO_SUBSTRING", NULL};
+char *proc_synopsis[] = { "log_keyvalue_parse LABEL_SYSLOG_BUFER", NULL};
 char proc_description[] = "decode a string from a log into key, values.  Useful for syslog parsing.";
 proc_example_t proc_examples[] = {
      {NULL,""}
@@ -121,7 +121,7 @@ proc_labeloffset_t proc_labeloffset[] =
      {"",0}
 };
 
-char procbuffer_option_str[]    = "a:A:i:I:XR:K:k:N:L:";
+char procbuffer_option_str[]    = "E:a:A:i:I:XR:K:k:N:L:";
 
 int procbuffer_option(void * vproc, void * type_table,
                       int c, const char * str) {
@@ -134,8 +134,14 @@ int procbuffer_option(void * vproc, void * type_table,
                break;
           case 'R':
                if (strlen(str) > 0) {
-                    proc->record_delimiter = (uint8_t)str[0];
-                    tool_print("record delimiter set to '%c'", str[0]);
+                    if (strcmp(str,"TAB") == 0) {
+                         proc->record_delimiter = '\t';
+                         tool_print("record delimter set to tab character");
+                    }
+                    else {
+                         proc->record_delimiter = (uint8_t)str[0];
+                         tool_print("record delimiter set to '%c'", str[0]);
+                    }
                }
                break;
           case 'a':
@@ -390,7 +396,7 @@ static size_t get_next_record(proc_instance_t * proc,
                break;
                
           }
-          if (buf[0] == proc->kv_delimiter) {
+          if (!vstart && (buf[0] == proc->kv_delimiter)) {
                if (!keyend) {
                     keyend = buf;
                }
